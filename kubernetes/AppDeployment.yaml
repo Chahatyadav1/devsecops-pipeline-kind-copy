@@ -16,7 +16,7 @@ spec:
         app: world-countries
     spec:
       containers:
-      - image: chahatyadav1/world-countries:d14fb322b18b5580342db03ea12a1eacbcc1b0dc
+      - image: asia-docker.pkg.dev/qwiklabs-gcp-03-60ac62ad23be/testing/world-app@sha256:2941b49aff900cfe0ebac9a1fc7c924c638ddd021823de78bceee4f3857a361d
         name: world-countries
         ports:
         - containerPort: 3000
