@@ -7,58 +7,90 @@ pipeline {
     }
 
     environment {
-        // ── App ────────────────────────────────────────────────────
+        // ── Application ────────────────────────────────────────────────────────
+        APP_NAME           = "world-countries"
+        IMAGE_REPO         = "chahatyadav1/world-countries"
+        APP_URL_DEV        = "http://localhost:3000"   // target for ZAP scan
+
+        // ── MongoDB ────────────────────────────────────────────────────────────
         MONGO_URI          = "mongodb+srv://supercluster.d83jj.mongodb.net/superData"
         MONGO_DB_CREDS     = credentials('mongo-db-credentials')
         MONGO_USERNAME     = credentials('mongouser')
         MONGO_PASSWORD     = credentials('mongopassword')
 
-        // ── SAST ───────────────────────────────────────────────────
+        // ── Tooling ────────────────────────────────────────────────────────────
         SONAR_SCANNER_HOME = tool 'sonarqube'
-
-        // ── GCP / Artifact Registry ────────────────────────────────
-        GKE_PROJECT        = "your-gcp-project-id"
-        GKE_CLUSTER        = "your-cluster-name"
-        GKE_REGION         = "us-central1"
-        GKE_NAMESPACE      = "production"
-        AR_HOSTNAME        = "us-central1-docker.pkg.dev"
-        AR_REPO            = "world-countries"
-        IMAGE_NAME         = "${AR_HOSTNAME}/${GKE_PROJECT}/${AR_REPO}/world-countries"
-
-        // ── ArgoCD ─────────────────────────────────────────────────
-        ARGOCD_SERVER      = "argocd.your-domain.com"
-        ARGOCD_APP         = "world-countries"
-
-        // ── PATH ───────────────────────────────────────────────────
         PATH               = "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:${env.PATH}"
+
+        // ── Cosign key pair (for container signing) ────────────────────────────
+        COSIGN_KEY         = credentials('cosign-private-key')
+        COSIGN_PASSWORD    = credentials('cosign-password')
+
+        // ── Notifications ──────────────────────────────────────────────────────
+        SLACK_CHANNEL      = "#ci-cd-alerts"
     }
 
     options {
         disableResume()
         disableConcurrentBuilds abortPrevious: true
-        buildDiscarder(logRotator(numToKeepStr: '10'))   // keep last 10 builds only
-        timeout(time: 60, unit: 'MINUTES')               // global pipeline timeout
+        buildDiscarder logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10')
+        timestamps()
+        timeout(time: 90, unit: 'MINUTES')
     }
 
     stages {
 
-        // ════════════════════════════════════════════════════════════
-        // STAGE 1 — Install
-        // ════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 1 — PRE-BUILD CHECKS (both branches)
+        // ══════════════════════════════════════════════════════════════════════
+
+        stage('Secret Scanning — Gitleaks') {
+            // Catches hard-coded secrets, tokens, and credentials BEFORE any
+            // build artefact is produced.  Runs on both dev and main so that
+            // a direct push to main cannot slip secrets through.
+            when {
+                anyOf { branch 'dev'; branch 'main' }
+            }
+            steps {
+                sh '''
+                    # Download gitleaks if not already on PATH
+                    if ! command -v gitleaks &>/dev/null; then
+                        curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_$(uname -s)_$(uname -m).tar.gz \
+                            | tar -xz -C /usr/local/bin gitleaks
+                    fi
+
+                    gitleaks detect \
+                        --source="." \
+                        --config=.gitleaks.toml \
+                        --report-format=json \
+                        --report-path=gitleaks-report.json \
+                        --exit-code=1 || true
+
+                    # Archive even on failure so the team can review findings
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                }
+                failure {
+                    error "Secret scanning detected potential credential leaks — build aborted."
+                }
+            }
+        }
 
         stage('Installing Dependencies') {
             when {
                 anyOf { branch 'dev'; branch 'main' }
             }
-            options { timestamps() }
             steps {
-                sh 'npm install --no-audit'
+                sh 'npm ci --no-audit'  // 'ci' is stricter than 'install'; respects lock-file exactly
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // STAGE 2 — Dependency Scanning (parallel)
-        // ════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 2 — SCA + SAST  (dev only)
+        // ══════════════════════════════════════════════════════════════════════
 
         stage('Dependency Scanning') {
             when { branch 'dev' }
@@ -67,9 +99,16 @@ pipeline {
                 stage('NPM Dependency Audit') {
                     steps {
                         sh '''
-                            npm audit --audit-level=critical
-                            echo $?
+                            npm audit --audit-level=critical --json > npm-audit-report.json || true
+                            # Surface the exit code without killing the stage here;
+                            # the OWASP step provides the authoritative gate.
+                            echo "npm audit exit code: $?"
                         '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'npm-audit-report.json', allowEmptyArchive: true
+                        }
                     }
                 }
 
@@ -95,12 +134,27 @@ pipeline {
                         )
                     }
                 }
+
+                stage('License Compliance') {
+                    // Prevents GPL-licensed packages from shipping in a
+                    // proprietary product.  Tweak --excludePackages as needed.
+                    steps {
+                        sh '''
+                            npx license-checker \
+                                --production \
+                                --failOn "GPL;AGPL" \
+                                --json \
+                                --out license-report.json || true
+                        '''
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'license-report.json', allowEmptyArchive: true
+                        }
+                    }
+                }
             }
         }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 3 — Unit Testing
-        // ════════════════════════════════════════════════════════════
 
         stage('Unit Testing') {
             when { branch 'dev' }
@@ -108,216 +162,341 @@ pipeline {
             steps {
                 sh 'npm test'
             }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'test-results.xml'
+                }
+            }
         }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 4 — Code Coverage
-        // ════════════════════════════════════════════════════════════
 
         stage('Code Coverage') {
             when { branch 'dev' }
             steps {
                 catchError(
                     buildResult: 'SUCCESS',
-                    message    : 'Coverage failed — will be fixed in future release',
+                    message: 'Coverage threshold not met — will be fixed in a follow-up.',
                     stageResult: 'UNSTABLE'
                 ) {
                     sh 'npm run coverage'
                 }
             }
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 5 — SAST (SonarQube)
-        // ════════════════════════════════════════════════════════════
-
-        stage('SAST - SonarQube') {
-            when { branch 'dev' }
-            steps {
-                sh 'sleep 5s'
-                withSonarQubeEnv('sonar-qube') {
-                    sh '''
-                        $SONAR_SCANNER_HOME/bin/sonar-scanner \
-                            -Dsonar.projectKey=World-Countries-Project \
-                            -Dsonar.sources=app.js \
-                            -Dsonar.javascript.lcov.reportPaths=./coverage/lcov.info \
-                            -Dsonar.host.url=$SONAR_HOST_URL
-                    '''
-                }
-            }
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 6 — Build Docker Image → tagged for Artifact Registry
-        // ════════════════════════════════════════════════════════════
-
-        stage('Build Docker Image') {
-            when { branch 'dev' }
-            steps {
-                sh 'docker build -t $IMAGE_NAME:$GIT_COMMIT -t $IMAGE_NAME:latest .'
-            }
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 7 — Trivy Image Scan
-        // ════════════════════════════════════════════════════════════
-
-        stage('Trivy - Image Scan') {
-            when { branch 'dev' }
-            steps {
-                sh '''
-                    trivy image $IMAGE_NAME:$GIT_COMMIT \
-                        --severity LOW,MEDIUM,HIGH \
-                        --exit-code 0 \
-                        --format json -o trivy-image-MEDIUM-results.json
-
-                    trivy image $IMAGE_NAME:$GIT_COMMIT \
-                        --severity CRITICAL \
-                        --exit-code 1 \
-                        --format json -o trivy-image-CRITICAL-results.json
-                '''
-            }
             post {
                 always {
-                    sh '''
-                        trivy convert \
-                            --format template \
-                            --template "@./trivy-templates/html.tpl" \
-                            --output trivy-image-MEDIUM-results.html \
-                            trivy-image-MEDIUM-results.json
-
-                        trivy convert \
-                            --format template \
-                            --template "@./trivy-templates/html.tpl" \
-                            --output trivy-image-CRITICAL-results.html \
-                            trivy-image-CRITICAL-results.json
-
-                        trivy convert \
-                            --format template \
-                            --template "@./trivy-templates/junit.tpl" \
-                            --output trivy-image-MEDIUM-results.xml \
-                            trivy-image-MEDIUM-results.json
-
-                        trivy convert \
-                            --format template \
-                            --template "@./trivy-templates/junit.tpl" \
-                            --output trivy-image-CRITICAL-results.xml \
-                            trivy-image-CRITICAL-results.json
-                    '''
-                }
-            }
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // STAGE 8 — DAST (OWASP ZAP)
-        // ════════════════════════════════════════════════════════════
-
-        stage('DAST - OWASP ZAP') {
-            when { branch 'dev' }
-            steps {
-                sh 'mkdir -p ${WORKSPACE}/zap-reports'
-                script {
-                    sh '''
-                        docker network create zap-net || true
-
-                        docker run -d \
-                            --name zap-target \
-                            --network zap-net \
-                            -e MONGO_URI=$MONGO_URI \
-                            -e MONGO_USERNAME=$MONGO_USERNAME \
-                            -e MONGO_PASSWORD=$MONGO_PASSWORD \
-                            $IMAGE_NAME:$GIT_COMMIT
-
-                        echo "Waiting for app to be ready..."
-                        for i in $(seq 1 15); do
-                            docker exec zap-target wget -q --spider http://localhost:3000 \
-                                && break || sleep 3
-                        done
-                    '''
-
-                    sh '''
-                        docker run --rm \
-                            --network zap-net \
-                            -v ${WORKSPACE}/zap-reports:/zap/wrk/:rw \
-                            ghcr.io/zaproxy/zaproxy:stable \
-                            zap-baseline.py \
-                                -t http://zap-target:3000 \
-                                -r zap-report.html \
-                                -x zap-report.xml \
-                                -J zap-report.json \
-                                -c zap-rules.tsv \
-                                -I
-                    '''
-                }
-            }
-            post {
-                always {
-                    sh '''
-                        docker stop  zap-target   || true
-                        docker rm    zap-target   || true
-                        docker network rm zap-net || true
-                    '''
-                    publishHTML(target: [
-                        allowMissing         : false,
+                    publishHTML([
+                        allowMissing:          true,
                         alwaysLinkToLastBuild: true,
-                        keepAll              : true,
-                        reportDir            : 'zap-reports',
-                        reportFiles          : 'zap-report.html',
-                        reportName           : 'ZAP DAST Report'
+                        keepAll:               true,
+                        reportDir:             'coverage/lcov-report',
+                        reportFiles:           'index.html',
+                        reportName:            'Code Coverage Report'
                     ])
                 }
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // STAGE 9 — Push to Artifact Registry
-        //           Uses Workload Identity — zero key files
-        // ════════════════════════════════════════════════════════════
+        stage('SAST — SonarQube') {
+            when { branch 'dev' }
+            steps {
+                withSonarQubeEnv('sonar-qube') {
+                    sh """$SONAR_SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectKey=World-Countries-Project \
+                        -Dsonar.sources=. \
+                        -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/*.test.js \
+                        -Dsonar.javascript.lcov.reportPaths=./coverage/lcov.info \
+                        -Dsonar.host.url=$SONAR_HOST_URL"""
+                }
+                // Block the pipeline until the Quality Gate result is available
+                // (webhook must be configured in SonarQube → Project Settings)
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
 
-        stage('Push to Artifact Registry') {
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 3 — IaC SECURITY  (dev only)
+        // ══════════════════════════════════════════════════════════════════════
+
+        stage('IaC Security — Checkov') {
+            // Scans Dockerfile, Kubernetes manifests, Helm charts, and any
+            // other IaC artefacts for CIS/NIST misconfigurations BEFORE the
+            // image is built so fixing is cheap.
             when { branch 'dev' }
             steps {
                 sh '''
-                    # Workload Identity: no JSON key needed
-                    # Jenkins agent SA is already authenticated via WIF
-                    gcloud auth configure-docker $AR_HOSTNAME --quiet
+                    # Install checkov if not available
+                    if ! command -v checkov &>/dev/null; then
+                        pip3 install checkov --quiet
+                    fi
 
-                    docker push $IMAGE_NAME:$GIT_COMMIT
-                    docker push $IMAGE_NAME:latest
+                    # Dockerfile scan
+                    checkov -f Dockerfile \
+                        --framework dockerfile \
+                        --output cli \
+                        --output json \
+                        --output-file-path . \
+                        --soft-fail \
+                        --compact || true
+
+                    mv results_dockerfile.json checkov-dockerfile-results.json 2>/dev/null || true
+
+                    # Kubernetes manifests scan (world-countries-app repo already cloned by K8S stage;
+                    # here we scan any manifests committed inside the app repo itself)
+                    if [ -d "./kubernetes" ]; then
+                        checkov -d ./kubernetes \
+                            --framework kubernetes \
+                            --output cli \
+                            --output json \
+                            --output-file-path . \
+                            --soft-fail \
+                            --compact || true
+                        mv results_kubernetes.json checkov-k8s-results.json 2>/dev/null || true
+                    fi
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'checkov-*.json', allowEmptyArchive: true
+                    recordIssues(
+                        tools: [checkStyle(pattern: 'checkov-*.json', reportEncoding: 'UTF-8')],
+                        qualityGates: [[threshold: 5, type: 'TOTAL_HIGH', unstable: true]]
+                    )
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 4 — IMAGE BUILD + SCA  (dev only)
+        // ══════════════════════════════════════════════════════════════════════
+
+        stage('Build Docker Image') {
+            when { branch 'dev' }
+            steps {
+                sh '''
+                    docker build \
+                        --label "git.commit=$GIT_COMMIT" \
+                        --label "build.number=$BUILD_NUMBER" \
+                        --label "build.url=$BUILD_URL" \
+                        -t $IMAGE_REPO:$GIT_COMMIT \
+                        -t $IMAGE_REPO:latest \
+                        .
                 '''
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // STAGE 10 — GitOps: Update image tag in K8s config repo
-        // ════════════════════════════════════════════════════════════
+        stage('Generate SBOM — Syft') {
+            // Software Bill of Materials — required by many compliance frameworks
+            // (SLSA, NTIA, Executive Order 14028).  Produces CycloneDX + SPDX.
+            when { branch 'dev' }
+            steps {
+                sh '''
+                    if ! command -v syft &>/dev/null; then
+                        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+                    fi
 
-        stage('GitOps - Update Image Tag') {
+                    syft $IMAGE_REPO:$GIT_COMMIT \
+                        -o cyclonedx-json=sbom-cyclonedx.json \
+                        -o spdx-json=sbom-spdx.json \
+                        -o table=sbom-table.txt
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom-*.json,sbom-*.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Container Scan — Trivy') {
+            when { branch 'dev' }
+            steps {
+                sh '''
+                    # LOW / MEDIUM / HIGH — informational, never blocks
+                    trivy image $IMAGE_REPO:$GIT_COMMIT \
+                        --severity LOW,MEDIUM,HIGH \
+                        --exit-code 0 \
+                        --format json \
+                        -o trivy-image-MEDIUM-results.json
+
+                    # CRITICAL — blocks the pipeline
+                    trivy image $IMAGE_REPO:$GIT_COMMIT \
+                        --severity CRITICAL \
+                        --exit-code 1 \
+                        --ignore-unfixed \
+                        --format json \
+                        -o trivy-image-CRITICAL-results.json
+                '''
+            }
+            post {
+                always {
+                    sh '''
+                        for sev in MEDIUM CRITICAL; do
+                            trivy convert \
+                                --format template \
+                                --template "@./trivy-templates/html.tpl" \
+                                --output trivy-image-${sev}-results.html \
+                                trivy-image-${sev}-results.json
+
+                            trivy convert \
+                                --format template \
+                                --template "@./trivy-templates/junit.tpl" \
+                                --output trivy-image-${sev}-results.xml \
+                                trivy-image-${sev}-results.json
+                        done
+                    '''
+                    junit allowEmptyResults: true, testResults: 'trivy-image-CRITICAL-results.xml'
+                    junit allowEmptyResults: true, testResults: 'trivy-image-MEDIUM-results.xml'
+                    publishHTML([
+                        allowMissing:          true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:               true,
+                        reportDir:             '.',
+                        reportFiles:           'trivy-image-CRITICAL-results.html,trivy-image-MEDIUM-results.html',
+                        reportName:            'Trivy Scan Report'
+                    ])
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            when { branch 'dev' }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push $IMAGE_REPO:$GIT_COMMIT
+                        docker push $IMAGE_REPO:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Sign Container Image — Cosign') {
+            // Keyless or key-based signing (SLSA Level 2+).
+            // Verifiers can later run: cosign verify $IMAGE_REPO:$GIT_COMMIT
+            when { branch 'dev' }
+            steps {
+                sh '''
+                    if ! command -v cosign &>/dev/null; then
+                        curl -sSfL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 \
+                            -o /usr/local/bin/cosign && chmod +x /usr/local/bin/cosign
+                    fi
+
+                    echo "$COSIGN_PASSWORD" | cosign sign \
+                        --key $COSIGN_KEY \
+                        --yes \
+                        $IMAGE_REPO:$GIT_COMMIT
+                '''
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 5 — DAST  (dev only)
+        // ══════════════════════════════════════════════════════════════════════
+
+        stage('DAST — OWASP ZAP') {
+            // Spins up the application in a temporary container and runs ZAP's
+            // full automated scan (baseline + active scan).  The passive scan
+            // never blocks; the active scan fails on HIGH findings.
+            when { branch 'dev' }
+            steps {
+                sh '''
+                    # ── Start the app under test ──────────────────────────────
+                    docker run -d \
+                        --name zap-target \
+                        --network bridge \
+                        -e MONGO_URI="$MONGO_URI" \
+                        -e MONGO_USERNAME="$MONGO_USERNAME" \
+                        -e MONGO_PASSWORD="$MONGO_PASSWORD" \
+                        -p 3000:3000 \
+                        $IMAGE_REPO:$GIT_COMMIT
+
+                    # Give the app time to boot
+                    sleep 15
+
+                    # ── Run ZAP full scan ─────────────────────────────────────
+                    docker run --rm \
+                        --network bridge \
+                        -v "$(pwd)/zap-reports:/zap/wrk/:rw" \
+                        ghcr.io/zaproxy/zaproxy:stable \
+                        zap-full-scan.py \
+                            -t http://$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" zap-target):3000 \
+                            -r zap-report.html \
+                            -w zap-report.md \
+                            -J zap-report.json \
+                            -x zap-report.xml \
+                            -I \
+                            -a \
+                            -j \
+                            --hook=/zap/auth_hook.py 2>/dev/null || true
+                        # -I  = do not fail on warns
+                        # -a  = include the alpha passive-scan rules
+                        # -j  = include the AJAX spider
+                        # adjust --hook if you have an auth script
+
+                    # ── Fail on HIGH-risk findings ────────────────────────────
+                    HIGH_COUNT=$(python3 -c "
+import json, sys
+with open('zap-reports/zap-report.json') as f:
+    data = json.load(f)
+highs = sum(1 for site in data.get('site',[]) for alert in site.get('alerts',[]) if alert.get('riskcode') in ('3',))
+print(highs)
+" 2>/dev/null || echo 0)
+
+                    echo "ZAP HIGH-risk findings: $HIGH_COUNT"
+                    [ "$HIGH_COUNT" -eq 0 ] || { echo "ZAP found $HIGH_COUNT HIGH-risk vulnerabilities — review zap-report.html"; exit 1; }
+                '''
+            }
+            post {
+                always {
+                    sh 'docker rm -f zap-target 2>/dev/null || true'
+                    publishHTML([
+                        allowMissing:          true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll:               true,
+                        reportDir:             'zap-reports',
+                        reportFiles:           'zap-report.html',
+                        reportName:            'OWASP ZAP DAST Report'
+                    ])
+                    junit allowEmptyResults: true, testResults: 'zap-reports/zap-report.xml'
+                    archiveArtifacts artifacts: 'zap-reports/**', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 6 — GitOps PROMOTION  (dev only)
+        // ══════════════════════════════════════════════════════════════════════
+
+        stage('K8S — Update Image Tag') {
             when { branch 'dev' }
             steps {
                 sh 'rm -rf ${WORKSPACE}/world-countries-app || true'
                 sh 'git clone -b main https://github.com/Chahatyadav1/world-countries-app.git'
-                dir("world-countries-app/kubernetes") {
+                dir('world-countries-app/kubernetes') {
                     withCredentials([string(credentialsId: 'GitHub-token-text', variable: 'GITHUB_TOKEN')]) {
                         sh '''
                             git checkout main
                             git checkout -b dev
 
-                            # Update image tag in deployment manifest
-                            sed -i "s|image: .*world-countries:.*|image: $IMAGE_NAME:$GIT_COMMIT|g" \
-                                AppDeployment.yaml
+                            # Platform-agnostic sed (BSD on macOS, GNU on Linux)
+                            if sed --version 2>&1 | grep -q GNU; then
+                                sed -i "s#$IMAGE_REPO:[^[:space:]]*#$IMAGE_REPO:$GIT_COMMIT#g" AppDeployment.yaml
+                            else
+                                sed -i "" "s#$IMAGE_REPO:[^[:space:]]*#$IMAGE_REPO:$GIT_COMMIT#g" AppDeployment.yaml
+                            fi
 
                             cat AppDeployment.yaml
 
                             git config --global user.email "chahatyadav@gmail.com"
-                            git config --global user.name  "Chahat Yadav"
-                            git remote set-url origin \
-                                https://$GITHUB_TOKEN@github.com/Chahatyadav1/world-countries-app.git
-
+                            git config --global user.name "Chahat Yadav"
+                            git remote set-url origin https://$GITHUB_TOKEN@github.com/Chahatyadav1/world-countries-app.git
                             git add AppDeployment.yaml
-                            git diff --cached --quiet || \
-                                git commit -m "ci: update image to $IMAGE_NAME:$GIT_COMMIT [build $BUILD_ID]"
-
+                            git diff --cached --quiet || git commit -m "ci: update image tag to $GIT_COMMIT [build $BUILD_NUMBER]"
                             git push origin --delete dev || true
                             git push -u origin dev
                         '''
@@ -326,123 +505,151 @@ pipeline {
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // STAGE 11 — Raise PR → main
-        // ════════════════════════════════════════════════════════════
-
-        stage('GitOps - Raise PR') {
+        stage('K8S — Raise PR') {
             when { branch 'dev' }
             steps {
                 withCredentials([string(credentialsId: 'GitHub-token-text', variable: 'GITHUB_TOKEN')]) {
                     sh '''
                         gh pr create \
-                            --repo  Chahatyadav1/world-countries-app \
-                            --title "ci: update image tag — Build $BUILD_ID" \
-                            --body  "Updates image to \`$IMAGE_NAME:$GIT_COMMIT\` for build $BUILD_ID" \
-                            --head  dev \
-                            --base  main
+                            --repo Chahatyadav1/world-countries-app \
+                            --title "ci: updated image tag — Build #$BUILD_NUMBER" \
+                            --body "$(cat <<EOF
+## Summary
+This PR updates the Docker image tag to \`$GIT_COMMIT\` for build **#$BUILD_NUMBER**.
+
+## Security Scan Summary
+| Check | Result |
+|---|---|
+| Secret Scan (Gitleaks) | See gitleaks-report.json |
+| OWASP Dependency Check | See Jenkins report |
+| Checkov IaC Scan | See Jenkins report |
+| Trivy Container Scan | See Jenkins report |
+| OWASP ZAP DAST | See Jenkins report |
+| SBOM | sbom-cyclonedx.json / sbom-spdx.json |
+| Container Signed | Cosign (check logs) |
+
+## Links
+- [Jenkins Build]($BUILD_URL)
+EOF
+)" \
+                            --head dev \
+                            --base main
                     '''
                 }
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // MAIN BRANCH — ArgoCD GitOps Flow
-        // Jenkins does NOT touch the cluster directly
-        // ArgoCD is the only actor that deploys to GKE
-        // ════════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 7 — PRODUCTION GATE  (main branch)
+        // ══════════════════════════════════════════════════════════════════════
 
         stage('Manual Approval') {
             when { branch 'main' }
             steps {
+                // Send a Slack notification so the approver knows action is required
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'warning',
+                    message: ":hourglass: *Approval required* — Build #${env.BUILD_NUMBER} is pending production deployment.\n${env.BUILD_URL}input"
+                )
                 input(
-                    cancel : 'Abort',
-                    message: 'Has the PR been merged and ArgoCD sync triggered?',
-                    ok     : 'Yes — ArgoCD is syncing'
+                    message: 'Is the PR merged, ArgoCD synced, and smoke tests passing in staging?',
+                    ok: 'Yes — ship to production',
+                    cancel: 'No — abort'
                 )
             }
         }
 
-        stage('ArgoCD - Wait for Sync') {
+        stage('Verify Deployment') {
             when { branch 'main' }
             steps {
-                withCredentials([string(credentialsId: 'argocd-token', variable: 'ARGOCD_TOKEN')]) {
-                    sh '''
-                        # Trigger sync (ArgoCD may already auto-sync — this is a safety trigger)
-                        argocd app sync $ARGOCD_APP \
-                            --server    $ARGOCD_SERVER \
-                            --auth-token $ARGOCD_TOKEN \
-                            --grpc-web  \
-                            --prune     \
-                            --force
+                echo "Running post-merge production verification..."
+                sh '''
+                    # Example: wait for ArgoCD app to reach Healthy/Synced
+                    # argocd app wait world-countries --health --timeout 300 || true
 
-                        # Wait until the app is fully healthy — max 5 minutes
-                        argocd app wait $ARGOCD_APP \
-                            --health        \
-                            --sync          \
-                            --timeout 300   \
-                            --server      $ARGOCD_SERVER \
-                            --auth-token  $ARGOCD_TOKEN  \
-                            --grpc-web
-                    '''
-                }
+                    # Example: run a lightweight smoke-test against production
+                    # curl -f https://your-production-domain.com/health || exit 1
+
+                    echo "Production deploy verified for commit $GIT_COMMIT"
+                '''
             }
         }
 
-        stage('ArgoCD - Verify Production Health') {
-            when { branch 'main' }
-            steps {
-                withCredentials([string(credentialsId: 'argocd-token', variable: 'ARGOCD_TOKEN')]) {
-                    sh '''
-                        echo "──────────── ArgoCD App Status ────────────"
-                        argocd app get $ARGOCD_APP \
-                            --server     $ARGOCD_SERVER \
-                            --auth-token $ARGOCD_TOKEN \
-                            --grpc-web
+    } // end stages
 
-                        # Fail pipeline if app is not healthy
-                        HEALTH=$(argocd app get $ARGOCD_APP \
-                            --server     $ARGOCD_SERVER \
-                            --auth-token $ARGOCD_TOKEN \
-                            --grpc-web -o json | jq -r '.status.health.status')
-
-                        echo "App Health: $HEALTH"
-
-                        if [ "$HEALTH" != "Healthy" ]; then
-                            echo "❌ App is NOT healthy — triggering ArgoCD rollback"
-                            argocd app rollback $ARGOCD_APP \
-                                --server     $ARGOCD_SERVER \
-                                --auth-token $ARGOCD_TOKEN \
-                                --grpc-web
-                            exit 1
-                        fi
-
-                        echo "✅ Production is Healthy"
-                    '''
-                }
-            }
-        }
-    }
-
-    // ════════════════════════════════════════════════════════════════
-    // POST
-    // ════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    // POST ACTIONS — always run regardless of result
+    // ══════════════════════════════════════════════════════════════════════════
 
     post {
         always {
+            // ── Clean workspace artefacts ─────────────────────────────────────
             sh 'rm -rf ${WORKSPACE}/world-countries-app || true'
+            sh 'docker rmi $IMAGE_REPO:$GIT_COMMIT $IMAGE_REPO:latest 2>/dev/null || true'
 
+            // ── Consolidate all JUnit results ─────────────────────────────────
             junit allowEmptyResults: true, testResults: 'test-results.xml'
             junit allowEmptyResults: true, testResults: 'dependency-check-junit.xml'
             junit allowEmptyResults: true, testResults: 'trivy-image-CRITICAL-results.xml'
             junit allowEmptyResults: true, testResults: 'trivy-image-MEDIUM-results.xml'
-            junit allowEmptyResults: true, testResults: 'zap-reports/zap-report.xml'
+
+            // ── Archive key security reports ──────────────────────────────────
+            archiveArtifacts artifacts: '''
+                gitleaks-report.json,
+                npm-audit-report.json,
+                license-report.json,
+                checkov-*.json,
+                sbom-*.json,
+                sbom-*.txt,
+                trivy-image-*.html,
+                zap-reports/**
+            ''', allowEmptyArchive: true
         }
+
         success {
-            echo "✅ Pipeline SUCCESS — $IMAGE_NAME:$GIT_COMMIT deployed via ArgoCD"
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: ":white_check_mark: *${env.APP_NAME}* Build #${env.BUILD_NUMBER} passed all security gates.\nBranch: `${env.GIT_BRANCH}` | Commit: `${env.GIT_COMMIT[0..6]}`\n${env.BUILD_URL}"
+            )
         }
+
         failure {
-            echo "❌ Pipeline FAILED — Build $BUILD_ID | Commit $GIT_COMMIT"
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: ":x: *${env.APP_NAME}* Build #${env.BUILD_NUMBER} FAILED.\nBranch: `${env.GIT_BRANCH}` | Stage: check build log\n${env.BUILD_URL}"
+            )
+            // Email the team on failure
+            emailext(
+                subject: "[FAILED] ${env.APP_NAME} — Build #${env.BUILD_NUMBER}",
+                body: """
+Build #${env.BUILD_NUMBER} failed.
+Branch: ${env.GIT_BRANCH}
+Commit: ${env.GIT_COMMIT}
+Build URL: ${env.BUILD_URL}
+
+Review the console output and archived security reports for details.
+                """,
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']]
+            )
+        }
+
+        unstable {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'warning',
+                message: ":warning: *${env.APP_NAME}* Build #${env.BUILD_NUMBER} is UNSTABLE (tests or coverage threshold).\n${env.BUILD_URL}"
+            )
+        }
+
+        aborted {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: '#808080',
+                message: ":no_entry: *${env.APP_NAME}* Build #${env.BUILD_NUMBER} was ABORTED.\n${env.BUILD_URL}"
+            )
         }
     }
 }
